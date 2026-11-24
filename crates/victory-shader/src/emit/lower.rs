@@ -994,7 +994,7 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 /// the last place of a result that is not exact is then one lower than the console's).
 /// Off by default: it is exact but untried in a game run, and adds instructions to every
 /// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
-fn f16_nearest_on() -> bool {
+pub(super) fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
         return on;
@@ -1011,12 +1011,65 @@ thread_local! {
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
-fn own_bits_on() -> bool {
+pub(super) fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-pub(super) fn host_max_wave() -> u32 {
+/// `VICTORY_STRICT_JOINS` set: a join only another join reads is an error,
+/// not read wherever that one is ([`Lower::join_masks`]).
+pub(super) fn strict_joins_on() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some())
+}
+
+/// `VICTORY_MESH_OUTPUT_STRICT` set: a mesh shader whose outputs pass the
+/// host's limit even at the lane count is refused instead of emitted under
+/// the lower maxima.
+pub(super) fn mesh_output_strict_on() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some())
+}
+
+/// `VICTORY_WAVE_WIDE=1`: the exact form that puts group barriers inside
+/// branches and loops, for a console wave64 run as two host waves.
+pub(super) fn wave_wide_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_WAVE_WIDE=0` turns off the wave-wide widening of the branches
+/// around a wave64 compute program's cross-lane code ([`super::widen`]).
+/// A separate rule from [`wave_wide_on`]: this path runs unless the switch
+/// says `0`, that one only when it says `1`.
+pub(super) fn widen_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_DEEP_SKIPS=0` turns off the exact form that follows every
+/// skip the code after it cannot see.
+pub(super) fn wave_deep_skips_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_LOCAL`: 0 each host wave is not a wave of its own; 1
+/// (the default) where that is the allocation idiom, then where it is not;
+/// 2 only where it is the allocation idiom.
+pub(super) fn wave_local_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_WAVE_LOCAL").as_deref() {
+        Some(v) if v == "0" => 0,
+        Some(v) if v == "idiom" => 2,
+        _ => 1,
+    })
+}
+
+/// The widest wave the host runs, as [`set_host_max_wave`] last set it (0:
+/// not known). Part of what a translation depends on
+/// ([`super::translation_settings`]).
+pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
@@ -4018,7 +4071,7 @@ impl<'a> Lower<'a> {
             // still emitted with the lower maxima (drivers take them);
             // refuse them here if one hangs.
             // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
+            if !fits(mesh) && mesh_output_strict_on() {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
             }
             self.s.mesh = Some(mesh);
@@ -10620,8 +10673,7 @@ impl<'a> Lower<'a> {
         // stop by name with it (vehicle paint pixel shaders at "the first
         // half of an interpolation", foliage mesh shaders); until those are
         // lowered they keep drawing with that zero.
-        static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
+        let strict = strict_joins_on();
         let mut work: Vec<Value> = if strict {
             self.read_phis.iter().copied().collect()
         } else {

@@ -111,6 +111,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use shader::view_heap_limit;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -198,6 +199,55 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             None => v.parse().ok(),
         });
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
+
+/// Everything a translation depends on beyond the console container and the
+/// code that translates it: the setting of every switch that changes the
+/// emitted code, the values a run picks for them, and the host facts known
+/// only at run time (the widest wave, the view heap's null slot).
+///
+/// A cache of translations must key on this along with the container and
+/// the build (`victory-gpu`'s shader cache does). It is computed here, where
+/// the switches are read, so a switch added to the translator is added to
+/// the key in the same place instead of in a list that has to be kept in
+/// step by hand.
+///
+/// Not part of it, because they change only what is reported and never the
+/// emitted code: `VICTORY_WAVE_WHY`, `VICTORY_REF_PS`/`_VS` and
+/// `VICTORY_DIFF_ONLY` (the differential tests), `VICTORY_SHADER_CENSUS`,
+/// `VICTORY_EMIT_DUMP`, `VICTORY_DXIL`.
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::new();
+    let word = |out: &mut Vec<u8>, name: &str, value: u32| {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(&value.to_le_bytes());
+    };
+    // Switches whose value is a number the translator parses.
+    word(&mut out, "VICTORY_SHADER_LOOP_LIMIT", loop_limit());
+    word(&mut out, "VICTORY_SHADER_OPT", shader_opt());
+    word(&mut out, "VICTORY_GROUP_SYNC", u32::from(group_sync()));
+    // Switches read as a flag, with the default each has when unset: the
+    // answer, not the raw bytes, so `=0`, `=no` and unset that agree agree
+    // here too.
+    word(&mut out, "VICTORY_F16_NEAREST", u32::from(lower::f16_nearest_on()));
+    word(&mut out, "VICTORY_WAVE_OWN_BITS", u32::from(lower::own_bits_on()));
+    word(&mut out, "VICTORY_WAVE_WIDE", u32::from(lower::wave_wide_on()));
+    word(&mut out, "VICTORY_WAVE_WIDE/widen", u32::from(lower::widen_on()));
+    word(&mut out, "VICTORY_WAVE_DEEP_SKIPS", u32::from(lower::wave_deep_skips_on()));
+    word(&mut out, "VICTORY_WAVE_LOCAL", u32::from(lower::wave_local_mode()));
+    word(&mut out, "VICTORY_STRICT_JOINS", u32::from(lower::strict_joins_on()));
+    word(
+        &mut out,
+        "VICTORY_MESH_OUTPUT_STRICT",
+        u32::from(lower::mesh_output_strict_on()),
+    );
+    // The host facts a run latches: a container translated with no known wave
+    // limit, or with no view-heap clamp, is not the same translation as one
+    // taken with them.
+    word(&mut out, "host_max_wave", lower::host_max_wave());
+    word(&mut out, "view_heap_limit", shader::view_heap_limit());
+    out
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -335,13 +385,13 @@ pub fn emit(
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
-        let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
+        let local_on = lower::wave_local_mode() != 0;
         // Where the wave operations are the allocation idiom
         // ([`lower::wave_local`]) that is exact. Other programs are taken
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = lower::wave_local_mode() == 2;
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -379,7 +429,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = lower::wave_wide_on();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -389,7 +439,7 @@ pub fn emit(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                let deep_on = lower::wave_deep_skips_on();
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -469,7 +519,7 @@ pub fn emit(
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
                 && what == lower::LANE_MASK
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+                && lower::widen_on() =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
@@ -780,6 +830,60 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    /// The shader cache keys on [`translation_settings`]. Every switch the
+    /// translator reads that changes the emitted code must be in it, or a
+    /// run is served the translation an earlier run cached with the switch
+    /// set the other way. Kept as a list here on purpose: a new switch in
+    /// `lower.rs` or `mod.rs` that changes the code and is not added to
+    /// `translation_settings` fails this test.
+    #[test]
+    fn every_switch_that_changes_the_code_is_in_the_settings() {
+        let settings = translation_settings();
+        let text = String::from_utf8_lossy(&settings);
+        for switch in [
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_SHADER_OPT",
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_F16_NEAREST",
+            "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE/widen",
+            "VICTORY_WAVE_DEEP_SKIPS",
+            "VICTORY_WAVE_LOCAL",
+            "VICTORY_STRICT_JOINS",
+            "VICTORY_MESH_OUTPUT_STRICT",
+            "host_max_wave",
+            "view_heap_limit",
+        ] {
+            assert!(text.contains(switch), "{switch} missing from translation_settings");
+        }
+        // The two switches that only report are deliberately left out.
+        for switch in ["VICTORY_WAVE_WHY", "VICTORY_SHADER_CENSUS"] {
+            assert!(!text.contains(switch), "{switch} should not be in the settings");
+        }
+    }
+
+    /// The host facts a run latches are in the settings, so a container
+    /// translated before the wave size or the view-heap clamp is known is
+    /// not reused after.
+    #[test]
+    fn the_latched_host_facts_change_the_settings() {
+        let before = translation_settings();
+        super::lower::set_host_max_wave(32);
+        super::shader::set_view_heap_limit(999);
+        let after = translation_settings();
+        assert_ne!(before, after);
+        // Both are spelled out, and a different value is a different key.
+        let text = String::from_utf8_lossy(&after);
+        assert!(text.contains("host_max_wave"));
+        assert!(text.contains("view_heap_limit"));
+        super::shader::set_view_heap_limit(1000);
+        assert_ne!(after, translation_settings());
+        // Leave the process as it was found: these are latched atomics.
+        super::lower::set_host_max_wave(0);
+        super::shader::set_view_heap_limit(0);
     }
     use super::container::SigElement;
     use super::shader::Shader;

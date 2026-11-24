@@ -124,6 +124,12 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The limit [`set_view_heap_limit`] last set (0: none). Part of what a
+/// translation depends on ([`super::translation_settings`]).
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
